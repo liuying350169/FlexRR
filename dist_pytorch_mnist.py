@@ -140,7 +140,7 @@ class Trainer(object):
         for i in range(self.args.world_size-1):
             time_offset = time[i]-t_avg
             offset = abs(time_offset/t_avg)
-            if i ==0:
+            if i == 0:
                 if(time_offset>=0):
                     #slow
                     self.line[i] = self.line[i]-(self.line[i] * offset)
@@ -167,6 +167,7 @@ class Trainer(object):
         if len(self.time)< self.args.world_size/2:
             #top 1/2
             self.fast_worker_list.append(distributed.get_rank())
+            self.counter_list.append(distributed.get_rank())
 
     def all_reduce_min(self, schedule, group):
         #tensor=,op=,group=
@@ -186,6 +187,7 @@ class Trainer(object):
         f.close()
         return schedule
 
+
     #task dist
     def fit(self, epochs):
         #line = [20000,40000]
@@ -204,14 +206,15 @@ class Trainer(object):
             #time[self.args.rank-1] = time_consume
             #self.fastworker_list()
 
-            x = []
-            if(self.time[distributed.get_rank()] == -1):
-                distributed.recv(x,src=1)
+            # x = []
+            # if(self.time[distributed.get_rank()] == -1):
+            #     distributed.recv(x,src=1)
 
             print(
                 'Epoch: {}/{},'.format(epoch, epochs),
                 'train loss: {}, train acc: {},'.format(train_loss, train_acc),
                 'test loss: {}, test acc: {}.'.format(test_loss, test_acc))
+
 
     def isstraggle(self,max,min):
         # is more than 20%    max-min/min
@@ -222,8 +225,15 @@ class Trainer(object):
         else:
             return False
 
+    def num_to_trans(self,fastworker_speed,slowworker_speed,fast_rest_samples,slow_rest_samples):
 
+        fastworker_predict_time = fast_rest_samples/fastworker_speed
+        slowworker_predict_time = slow_rest_samples/slowworker_speed
+        time_avg = (fastworker_predict_time+slowworker_predict_time)/2
+        trans_time = slowworker_predict_time - time_avg
+        task_to_trans = trans_time * slowworker_speed
 
+        return task_to_trans
 
     def train(self):
         #every epoch
@@ -236,24 +246,20 @@ class Trainer(object):
         #new_group #ranks & timeout
         group_list = [i for i in range(self.args.world_size)]
         group = distributed.new_group(group_list)
-
-
         #needs global timeline
         counter = 0
         #default is 20000 sample batch_size is 1, max counter is 20000
         time_begin = time.time()
         total = len(train_loader)
-        time_start = time.time()
 
         while(True):
-
             task_ready = []
             task_all = []
+
             for idx in enumerate(train_loader):
                 task_all.append(idx)
 
             for idx, (data, label) in enumerate(train_loader):
-
                 if self.args.rank == 0:
                     time.sleep(0)
                 elif self.args.rank == 1:
@@ -264,25 +270,37 @@ class Trainer(object):
                 if(counter % 100 == 0):
                     #all_reduce
                     time_now = time.time()
-                    time_consume = time_now - time_start
+                    time_consume = time_now - time_begin
                     print("time_consume", time_consume)
+
 
                     schedule = torch.Tensor([time_consume])
 
-                    if self.isstraggle(self.all_reduce_max(schedule=schedule, group=group),self.all_reduce_min(schedule=schedule, group=group)):
-                    #if len(self.fast_worker_list)>0:
+                    if self.isstraggle(self.all_reduce_max(schedule=schedule, group=group), self.all_reduce_min(schedule=schedule, group=group)):
+
                         #calculate task_to_trans
-                        target_worker = self.fast_worker_list[0]
-                        percentage = counter / total
-                        rest_task = total-counter
-                        time_now = time.time()
-                        time_consume = time_now - time_begin
-                        time_predict = time_consume/percentage
-                        target_worker_speed = total/self.time[target_worker]
-                        local_worker_speed = total/time_predict
-                        speed_avg = (target_worker_speed+local_worker_speed)/2
-                        time_avg = rest_task/speed_avg
-                        task_to_trans = rest_task - (time_avg*local_worker_speed)
+                        if(schedule == self.all_reduce_min(schedule=schedule, group=group)):
+                            fastworker_speed = counter/time_consume
+                            fast_rest_samples = total - counter
+                            fast_list = [fastworker_speed,fast_rest_samples]
+
+                            slowworker = 1
+                            distributed.isend(fast_list, dst=slowworker)
+                            slow_list = []
+                            distributed.irecv(slow_list, src=slowworker)
+
+                        elif(schedule == self.all_reduce_max(schedule=schedule, group=group)):
+                            slowworker_speed = counter/time_consume
+                            slow_rest_samples = total - counter
+                            slow_list = [slowworker_speed,slow_rest_samples]
+                            fastworker = 0
+                            distributed.isend(slow_list, dst=fastworker)
+                            fast_list = []
+                            distributed.irecv(fast_list, src=fastworker)
+
+
+                        task_to_trans = self.num_to_trans(fast_list[0],fast_list[1],slow_list[0],slow_list[1])
+
 
                         rest_task_list = task_all - task_ready
                         task_to_trans_list = rest_task_list[:task_to_trans]
@@ -351,9 +369,7 @@ class Trainer(object):
     def evaluate(self):
         test_loss = Average()
         test_acc = Accuracy()
-
         self.net.eval()
-
         with torch.no_grad():
             for data, label in self.test_loader:
                 data = data.to(self.device)
